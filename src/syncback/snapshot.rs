@@ -131,6 +131,13 @@ impl<'sync> SyncbackSnapshot<'sync> {
         inst_path(self.new_tree(), referent)
     }
 
+    /// Returns a path to the provided Instance in the old DOM. This path is
+    /// where you would look for the object in Roblox Studio.
+    #[inline]
+    pub fn get_old_inst_path(&self, referent: Ref) -> String {
+        inst_path(self.old_tree(), referent)
+    }
+
     /// Returns an Instance from the old tree with the provided referent, if it
     /// exists.
     #[inline]
@@ -179,6 +186,12 @@ impl<'sync> SyncbackSnapshot<'sync> {
         self.data.new_tree
     }
 
+    /// Returns the WeakDom used for the 'old' tree.
+    #[inline]
+    pub fn old_tree(&self) -> &'sync WeakDom {
+        self.data.old_tree.inner()
+    }
+
     /// Returns user-specified property ignore rules.
     #[inline]
     pub fn ignore_props(&self) -> Option<&HashMap<String, Vec<String>>> {
@@ -202,7 +215,11 @@ impl<'sync> SyncbackSnapshot<'sync> {
 
 pub fn filter_out_property(inst: &Instance, prop_name: &str) -> bool {
     match inst.class.as_str() {
-        "Script" | "LocalScript" | "ModuleScript" => prop_name == "Source",
+        "Script" | "LocalScript" | "ModuleScript" => {
+            // These properties shouldn't be set by scripts that are created via
+            // `$path` or via being on the file system.
+            prop_name == "Source" || prop_name == "ScriptGuid"
+        }
         "LocalizationTable" => prop_name == "Contents",
         "StringValue" => prop_name == "Value",
         _ => false,

@@ -1,5 +1,5 @@
 use std::{
-    io::{self, Write as _},
+    io::{self, BufReader, Write as _},
     mem::forget,
     path::{Path, PathBuf},
     time::Instant,
@@ -10,7 +10,6 @@ use clap::Parser;
 use fs_err::File;
 use memofs::Vfs;
 use rbx_dom_weak::{InstanceBuilder, WeakDom};
-use rbx_reflection::ReflectionDatabase;
 use termcolor::{BufferWriter, Color, ColorChoice, ColorSpec, WriteColor};
 
 use crate::{
@@ -23,24 +22,29 @@ use super::{resolve_path, GlobalOptions};
 const UNKNOWN_INPUT_KIND_ERR: &str = "Could not detect what kind of file was inputted. \
                                        Expected input file to end in .rbxl, .rbxlx, .rbxm, or .rbxmx.";
 
-/// Performs syncback for a project file
+/// Performs 'syncback' for the provided project, using the `input` file
+/// given.
+///
+/// Syncback exists to convert Roblox files into a Rojo project automatically.
+/// It uses the project.json file provided to traverse the Roblox file passed as
+/// to serialize Instances to the file system in a format that Rojo understands.
 #[derive(Debug, Parser)]
 pub struct SyncbackCommand {
     /// Path to the project to sync back to.
     #[clap(default_value = "")]
     pub project: PathBuf,
 
-    /// Path to the place to perform syncback on.
+    /// Path to the Roblox file to pull Instances from.
     #[clap(long, short)]
     pub input: PathBuf,
 
-    /// If provided, syncback will list all of the changes it will make to the
-    /// file system before making them.
+    /// If provided, a list all of the files and directories that will be
+    /// added or removed is emitted.
     #[clap(long, short)]
     pub list: bool,
 
     /// If provided, syncback will not actually write anything to the file
-    /// system.
+    /// system. The command will otherwise run normally.
     #[clap(long)]
     pub dry_run: bool,
 
@@ -55,23 +59,21 @@ impl SyncbackCommand {
         let path_new = resolve_path(&self.input);
 
         let input_kind = FileKind::from_path(&path_new).context(UNKNOWN_INPUT_KIND_ERR)?;
-        let dom_start = Instant::now();
-        log::info!("Reading place file at {}", path_new.display());
+        let dom_start_timer = Instant::now();
         let dom_new = read_dom(&path_new, input_kind)?;
-        log::info!(
+        log::debug!(
             "Finished opening file in {:0.02}s",
-            dom_start.elapsed().as_secs_f32()
+            dom_start_timer.elapsed().as_secs_f32()
         );
 
         let vfs = Vfs::new_default();
         vfs.set_watch_enabled(false);
 
-        let project_start = Instant::now();
-        log::info!("Opening project at {}", path_old.display());
+        let project_start_timer = Instant::now();
         let session_old = ServeSession::new(vfs, path_old.clone())?;
-        log::info!(
+        log::debug!(
             "Finished opening project in {:0.02}s",
-            project_start.elapsed().as_secs_f32()
+            project_start_timer.elapsed().as_secs_f32()
         );
 
         let mut dom_old = session_old.tree();
@@ -92,17 +94,17 @@ impl SyncbackCommand {
             }
         }
 
-        let start = Instant::now();
-        log::info!("Beginning syncback...");
+        let syncback_timer = Instant::now();
+        println!("Beginning syncback...");
         let snapshot = syncback_loop(
             session_old.vfs(),
             &mut dom_old,
             dom_new,
             session_old.root_project(),
         )?;
-        log::info!(
+        log::debug!(
             "Syncback finished in {:.02}s!",
-            start.elapsed().as_secs_f32()
+            syncback_timer.elapsed().as_secs_f32()
         );
 
         let base_path = session_old.root_project().folder_location();
@@ -127,8 +129,9 @@ impl SyncbackCommand {
                     return Ok(());
                 }
             }
-            log::info!("Writing to the file system...");
+            println!("Writing to the file system...");
             snapshot.write_to_vfs(base_path, session_old.vfs())?;
+            println!("Finished syncback.")
         } else {
             println!(
                 "Would write {} files/folders and remove {} files/folders.",
@@ -149,28 +152,20 @@ impl SyncbackCommand {
 }
 
 fn read_dom(path: &Path, file_kind: FileKind) -> anyhow::Result<WeakDom> {
-    let content = File::open(path)?;
+    let content = BufReader::new(File::open(path)?);
     match file_kind {
-        FileKind::Rbxl => {
-            // HACK: A custom reflection database is used to deserialize UniqueId
-            let db = binary_db().expect("A custom ReflectionDatabase to deserialize UniqueId");
-            let binary_decoder = rbx_binary::Deserializer::new().reflection_database(&db);
-            binary_decoder.deserialize(content).with_context(|| {
-                format!(
-                    "Could not deserialize binary place file at {}",
-                    path.display()
-                )
-            })
-        }
+        FileKind::Rbxl => rbx_binary::from_reader(content).with_context(|| {
+            format!(
+                "Could not deserialize binary place file at {}",
+                path.display()
+            )
+        }),
         FileKind::Rbxlx => rbx_xml::from_reader(content, xml_decode_config())
             .with_context(|| format!("Could not deserialize XML place file at {}", path.display())),
         FileKind::Rbxm => {
-            // HACK: A custom reflection database is used to deserialize UniqueId
-            let db = binary_db().expect("A custom ReflectionDatabase to deserialize UniqueId");
-            let binary_decoder = rbx_binary::Deserializer::new().reflection_database(&db);
-            let temp_tree = binary_decoder.deserialize(content).with_context(|| {
+            let temp_tree = rbx_binary::from_reader(content).with_context(|| {
                 format!(
-                    "Could not deserialize binary model file at {}",
+                    "Could not deserialize binary place file at {}",
                     path.display()
                 )
             })?;
@@ -214,31 +209,6 @@ fn process_model_dom(dom: WeakDom) -> anyhow::Result<WeakDom> {
 
 fn xml_decode_config() -> rbx_xml::DecodeOptions<'static> {
     rbx_xml::DecodeOptions::new().property_behavior(rbx_xml::DecodePropertyBehavior::ReadUnknown)
-}
-
-fn binary_db() -> Option<ReflectionDatabase<'static>> {
-    // HACK: UniqueId does not deserialize right now, so we force it to
-    // Don't forget to change this in the syncback test when changing it here.
-    use rbx_reflection::{PropertyKind, PropertySerialization};
-    use std::borrow::Cow;
-
-    let mut unique_id = rbx_reflection_database::get()
-        .classes
-        .get("Instance")?
-        .properties
-        .get("UniqueId")?
-        .clone();
-    unique_id.kind = PropertyKind::Canonical {
-        serialization: PropertySerialization::Serializes,
-    };
-
-    let mut db = rbx_reflection_database::get().clone();
-    let instance = db.classes.get_mut("Instance")?;
-    instance
-        .properties
-        .insert(Cow::Borrowed("UniqueId"), unique_id);
-
-    Some(db)
 }
 
 /// The different kinds of input that Rojo can syncback.

@@ -219,41 +219,64 @@ pub fn syncback_loop(
             continue;
         }
 
-        let mut syncback_res = middleware.syncback(&snapshot);
-        if syncback_res.is_err() && middleware == Middleware::Dir {
-            let new_middleware = match env::var(DEBUG_MODEL_FORMAT_VAR) {
-                Ok(value) if value == "1" => Middleware::Rbxmx,
-                Ok(value) if value == "2" => Middleware::JsonModel,
-                _ => Middleware::Rbxm,
-            };
-
-            let file_name = snapshot
-                .path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .context("Directory middleware should have a name in its path")?;
-            let mut path = snapshot.path.clone();
-            path.set_file_name(format!(
-                "{file_name}.{}",
-                extension_for_middleware(new_middleware)
-            ));
-
-            let new_snapshot = snapshot.with_new_path(path, snapshot.new, snapshot.old);
-            log::warn!(
-                "Could not syncback {inst_path} as a Directory, it will \
-                instead be synced back as a {new_middleware:?}."
-            );
-            syncback_res = new_middleware.syncback(&new_snapshot);
-        }
-        let syncback = syncback_res.with_context(|| format!("Failed to syncback {inst_path}"))?;
+        let syncback = match middleware.syncback(&snapshot) {
+            Ok(syncback) => syncback,
+            Err(err) if middleware == Middleware::Dir => {
+                if snapshot.old_inst().is_some() {
+                    // We need to remove the old FS representation if we're
+                    // reserializing it as an rbxm.
+                    fs_snapshot.remove_dir(&snapshot.path);
+                }
+                let new_middleware = match env::var(DEBUG_MODEL_FORMAT_VAR) {
+                    Ok(value) if value == "1" => Middleware::Rbxmx,
+                    Ok(value) if value == "2" => Middleware::JsonModel,
+                    _ => Middleware::Rbxm,
+                };
+                let file_name = snapshot
+                    .path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .context("Directory middleware should have a name in its path")?;
+                let mut path = snapshot.path.clone();
+                path.set_file_name(format!(
+                    "{file_name}.{}",
+                    extension_for_middleware(new_middleware)
+                ));
+                let new_snapshot = snapshot.with_new_path(path, snapshot.new, snapshot.old);
+                log::warn!(
+                    "Could not syncback {inst_path} as a Directory because: {err}.\n\
+                    It will instead be synced back as a {new_middleware:?}."
+                );
+                new_middleware
+                    .syncback(&new_snapshot)
+                    .with_context(|| format!("Failed to syncback {inst_path}"))?
+            }
+            Err(err) => anyhow::bail!("Failed to syncback {inst_path} because {err}"),
+        };
 
         if !syncback.removed_children.is_empty() {
             log::debug!(
                 "removed children for {inst_path}: {}",
                 syncback.removed_children.len()
             );
-            for inst in &syncback.removed_children {
+            'remove: for inst in &syncback.removed_children {
                 let path = inst.metadata().instigating_source.as_ref().unwrap().path();
+                let inst_path = snapshot.get_old_inst_path(inst.id());
+                if !is_valid_path(&ignore_patterns, project_path, path) {
+                    log::debug!(
+                        "Skipping removing {} because its matches an ignore pattern",
+                        path.display()
+                    );
+                    continue;
+                }
+                if let Some(syncback_rules) = &project.syncback_rules {
+                    for ignored in &syncback_rules.ignore_trees {
+                        if inst_path.starts_with(ignored.as_str()) {
+                            log::debug!("Skipping removing {inst_path} because its path is blocked by project");
+                            continue 'remove;
+                        }
+                    }
+                }
                 if path.is_dir() {
                     fs_snapshot.remove_dir(path)
                 } else {
