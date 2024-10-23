@@ -209,8 +209,6 @@ impl<'sync> SyncbackSnapshot<'sync> {
 pub fn filter_out_property(inst: &Instance, prop_name: &str) -> bool {
     match inst.class.as_str() {
         "Script" | "LocalScript" | "ModuleScript" => {
-            // These properties shouldn't be set by scripts that are created via
-            // `$path` or via being on the file system.
             prop_name == "Source" || prop_name == "ScriptGuid"
         }
         "LocalizationTable" => prop_name == "Contents",
